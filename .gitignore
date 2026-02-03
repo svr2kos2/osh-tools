@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Logs and temp files
+**/*.log
+**/*.tmp
+**/*.rs.bk
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# Env files
+.env
+.env.*

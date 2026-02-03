@@ -1,0 +1,15 @@
+{
+  "max_devices": 16,
+  "secret_key": "change-me-in-production",
+  "devices": [
+    {
+      "device_id": "aa58c04b-ec58-4b13-8262-969dfed3100d",
+      "device_name": "svr2kos2-pc",
+      "platform": "windows",
+      "shell": "powershell",
+      "status": "approved",
+      "created_at": "2026-02-02T22:46:49.780115830Z",
+      "last_seen": "2026-02-03T01:09:17.867831605Z"
+    }
+  ]
+}
