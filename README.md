@@ -1,6 +1,19 @@
-# OSH Build & Deployment Guide
+# OSH Tools
 
-> This guide has been moved to `README.md` and kept there as the primary documentation.
+A remote exec toolchain with a Linux relay + CLI and a Windows daemon.
+
+## Quick Install (Linux VPS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/svr2kos2/osh-tools/master/install.sh -o install.sh
+sudo bash install.sh
+```
+
+What it does:
+- Downloads the latest Linux release asset
+- Installs `osh-relay`, `osh`, `osh-admin` to `/usr/local/bin`
+- Creates `/etc/osh/devices.json` with a generated `secret_key`
+- Registers and starts the `osh-relay` systemd service
 
 ## Directory Structure
 
