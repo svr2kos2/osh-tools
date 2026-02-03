@@ -42,5 +42,6 @@ jobs:
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
           target_commitish: ${{ github.sha }}
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
           files: |
             osh-tools-linux-x86_64.tar.gz
