@@ -126,3 +126,12 @@ osh-admin reload
 # On VPS: Execute command on remote device
 osh mypc "Get-Process | Select-Object -First 5"
 ```
+
+## Releases
+
+Releases are automatically created via GitHub Actions when a new tag is pushed. For information about:
+- How to create releases
+- Troubleshooting 403 permission errors
+- Required repository configuration
+
+See [RELEASE.md](RELEASE.md) for detailed instructions.

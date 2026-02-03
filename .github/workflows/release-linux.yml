@@ -13,6 +13,9 @@ on:
         description: "Tag to release (e.g. v0.1.0)"
         required: true
 
+# NOTE: Repository-level workflow permissions must be set to "Read and write permissions"
+# in Settings > Actions > General > Workflow permissions
+# This allows the GITHUB_TOKEN to create releases
 permissions:
   contents: write
 
@@ -48,3 +51,4 @@ jobs:
           token: ${{ secrets.RELEASE_TOKEN || github.token }}
           files: |
             osh-tools-linux-x86_64.tar.gz
+          token: ${{ secrets.GITHUB_TOKEN }}
