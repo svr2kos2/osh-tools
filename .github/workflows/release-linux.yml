@@ -1,5 +1,8 @@
 name: release-linux
 
+env:
+  GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
 on:
   push:
     tags:
