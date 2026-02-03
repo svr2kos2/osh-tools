@@ -1,8 +1,5 @@
 name: release-linux
 
-env:
-  GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-
 on:
   push:
     tags:
@@ -48,7 +45,6 @@ jobs:
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
           target_commitish: ${{ github.sha }}
-          # token: ${{ secrets.RELEASE_TOKEN || github.token }}
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN || github.token }}
           files: |
             osh-tools-linux-x86_64.tar.gz
-          token: ${{ secrets.GITHUB_TOKEN }}
