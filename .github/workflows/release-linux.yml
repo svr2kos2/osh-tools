@@ -6,6 +6,9 @@ on:
       - "v*"
   workflow_dispatch:
 
+# NOTE: Repository-level workflow permissions must be set to "Read and write permissions"
+# in Settings > Actions > General > Workflow permissions
+# This allows the GITHUB_TOKEN to create releases
 permissions:
   contents: write
 
@@ -36,3 +39,4 @@ jobs:
         with:
           files: |
             osh-tools-linux-x86_64.tar.gz
+          token: ${{ secrets.GITHUB_TOKEN }}
