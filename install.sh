@@ -9,6 +9,8 @@ CONFIG_FILE="${CONFIG_DIR}/devices.json"
 SERVICE_FILE="/etc/systemd/system/osh-relay.service"
 PROFILE_FILE="/etc/profile.d/osh.sh"
 
+RUN_USER="${SUDO_USER:-${USER}}"
+
 if [ "${EUID}" -ne 0 ]; then
   echo "Please run as root (sudo ./install.sh)."
   exit 1
@@ -50,10 +52,6 @@ if [ ! -f "${PROFILE_FILE}" ]; then
   chmod 0644 "${PROFILE_FILE}"
 fi
 
-if ! id -u osh >/dev/null 2>&1; then
-  useradd --system --no-create-home --shell /usr/sbin/nologin osh
-fi
-
 if [ ! -f "${CONFIG_FILE}" ]; then
   mkdir -p "${CONFIG_DIR}"
   SECRET_KEY="$(openssl rand -hex 16 2>/dev/null || cat /proc/sys/kernel/random/uuid | tr -d '-')"
@@ -65,7 +63,7 @@ if [ ! -f "${CONFIG_FILE}" ]; then
 }
 EOF
   chmod 0640 "${CONFIG_FILE}"
-  chown osh:osh "${CONFIG_FILE}" || true
+  chown "${RUN_USER}":"${RUN_USER}" "${CONFIG_FILE}" || true
 fi
 
 cat > "${SERVICE_FILE}" <<EOF
@@ -75,7 +73,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=osh
+User=${RUN_USER}
 ExecStart=${INSTALL_DIR}/osh-relay --config ${CONFIG_FILE}
 Restart=always
 RestartSec=3
