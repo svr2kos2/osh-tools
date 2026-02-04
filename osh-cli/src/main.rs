@@ -372,8 +372,5 @@ async fn run_exec(cli: &Cli) -> Result<i32> {
     let _ = ws_write.close().await;
     stdin_handle.abort();
     
-    // Ensure cursor is on a new line after output
-    println!();
-    
     Ok(exit_code)
 }
