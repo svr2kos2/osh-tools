@@ -20,7 +20,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, trace, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use osh_cli::protocol::{decode_payload, timestamp_ms, ExecRequest, InputMessage, RelayResponse};
+use osh_cli::protocol::{decode_and_filter_payload, timestamp_ms, ExecRequest, InputMessage, RelayResponse};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -109,9 +109,11 @@ impl RawModeGuard {
             libc::cfmakeraw(&mut termios);
             
             if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
+                eprintln!("Failed to set raw mode");
                 return None;
             }
             
+            eprintln!("Raw mode enabled successfully");
             Some(Self {
                 original_termios: original,
                 fd,
@@ -246,7 +248,7 @@ async fn run_exec(cli: &Cli) -> Result<i32> {
                                     RelayResponse::DATA { req_id: rid, payload } => {
                                         if rid == req_id_for_ws {
                                             debug!("DATA message, payload len: {}", payload.len());
-                                            let data = decode_payload(&payload)?;
+                                            let data = decode_and_filter_payload(&payload)?;
                                             if !data.is_empty() {
                                                 let mut stdout = std::io::stdout().lock();
                                                 stdout.write_all(&data)?;
@@ -347,8 +349,20 @@ async fn run_exec(cli: &Cli) -> Result<i32> {
             
             // Handle stdin input
             Some(data) = stdin_rx.recv() => {
+                // Debug: log stdin bytes in hex
+                if cli.verbose {
+                    let hex: Vec<String> = data.iter().map(|b| format!("{:02X}", b)).collect();
+                    debug!("Stdin read: {}", hex.join(" "));
+                }
+                
                 let input_msg = InputMessage::new(req_id_for_stdin.clone(), &data);
                 let json = serde_json::to_string(&input_msg)?;
+                
+                // Debug: log what we send to daemon
+                if cli.verbose {
+                    debug!("Sending to daemon: {}", json);
+                }
+                
                 ws_write.send(Message::Binary(json.into_bytes().into())).await?;
             }
             
