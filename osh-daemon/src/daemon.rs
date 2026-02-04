@@ -425,20 +425,12 @@ async fn handle_command(
                 .ok_or_else(|| anyhow::anyhow!("DATA missing payload"))?;
             let data = decode_payload(payload)?;
             
-            // Ctrl+C handling: terminate process when interrupt is sent
-            if data.len() == 1 && data[0] == 0x03 {
-                info!("CTRL+C: req_id={}, terminating PTY process", req_id);
-                if let Err(e) = pty_manager.kill(&req_id).await {
-                    warn!("Failed to terminate process on Ctrl+C: {}", e);
-                }
-                return Ok(());
-            }
-
-            // Normalize line endings for PTY compatibility
-            let data = convert_line_endings(&data);
-
-            // Log received input after normalization for debugging
+            // Log received input for debugging
             info!("DATA: req_id={}, len={}, content={:?}", req_id, data.len(), String::from_utf8_lossy(&data));
+            
+            // Convert \r to \r\n on Windows for PTY compatibility
+            #[cfg(target_os = "windows")]
+            let data = convert_line_endings(&data);
             
             if let Err(e) = pty_manager.send_input(&req_id, &data).await {
                 warn!("Failed to send input (process might be non-PTY): {}", e);
@@ -500,12 +492,13 @@ fn escape_control_chars(data: &[u8]) -> Vec<u8> {
     result
 }
 
-/// Normalize line endings for PTY compatibility
+/// Convert \r to \r\n for Windows PTY compatibility
+/// Only used on Windows target
 #[cfg(target_os = "windows")]
 fn convert_line_endings(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(data.len() * 2);
     let mut i = 0;
-
+    
     while i < data.len() {
         let b = data[i];
         if b == b'\r' {
@@ -521,40 +514,11 @@ fn convert_line_endings(data: &[u8]) -> Vec<u8> {
                 result.push(b'\n');
                 i += 1;
             }
-        } else if b == b'\n' {
-            // Lone \n, convert to \r\n for Windows PTY
-            result.push(b'\r');
-            result.push(b'\n');
-            i += 1;
         } else {
             result.push(b);
             i += 1;
         }
     }
-
-    result
-}
-
-#[cfg(not(target_os = "windows"))]
-fn convert_line_endings(data: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(data.len());
-    let mut i = 0;
-
-    while i < data.len() {
-        let b = data[i];
-        if b == b'\r' {
-            // Convert \r or \r\n to \n
-            if i + 1 < data.len() && data[i + 1] == b'\n' {
-                i += 2;
-            } else {
-                i += 1;
-            }
-            result.push(b'\n');
-        } else {
-            result.push(b);
-            i += 1;
-        }
-    }
-
+    
     result
 }
