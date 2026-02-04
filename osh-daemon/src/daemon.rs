@@ -492,7 +492,7 @@ fn escape_control_chars(data: &[u8]) -> Vec<u8> {
     result
 }
 
-/// Convert \r to \r\n for Windows PTY compatibility
+/// Convert \r to \r\n and \n to \r\n for Windows PTY compatibility
 /// Only used on Windows target
 #[cfg(target_os = "windows")]
 fn convert_line_endings(data: &[u8]) -> Vec<u8> {
@@ -514,6 +514,12 @@ fn convert_line_endings(data: &[u8]) -> Vec<u8> {
                 result.push(b'\n');
                 i += 1;
             }
+        } else if b == b'\n' {
+            // Check if previous char was \r (already handled above)
+            // This case means standalone \n, convert to \r\n
+            result.push(b'\r');
+            result.push(b'\n');
+            i += 1;
         } else {
             result.push(b);
             i += 1;
