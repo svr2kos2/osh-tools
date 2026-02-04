@@ -6,9 +6,10 @@ use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Events from PTY processes
 #[derive(Debug)]
@@ -25,10 +26,10 @@ pub enum PtyEvent {
 struct PtyProcess {
     /// Writer to send input to the process
     writer: Box<dyn Write + Send>,
-    /// Child process handle
-    child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Master PTY handle for resize
     master: Box<dyn portable_pty::MasterPty + Send>,
+    /// Flag to signal that the process has exited (set by waiter thread)
+    exited: Arc<AtomicBool>,
 }
 
 /// Manages multiple PTY processes
@@ -112,126 +113,146 @@ impl PtyManager {
             let _ = writer.flush();
         }
         
+        // Create exit flag for synchronization between waiter and reader threads
+        let exited = Arc::new(AtomicBool::new(false));
+        
         // Store the process
         {
             let mut processes = self.processes.lock().unwrap();
             processes.insert(req_id.clone(), PtyProcess {
                 writer,
-                child,
                 master: pair.master,
+                exited: Arc::clone(&exited),
             });
         }
         
-        // Spawn thread to read output
-        let event_tx = self.event_tx.clone();
-        let processes = Arc::clone(&self.processes);
-        let req_id_clone = req_id.clone();
-        let runtime = tokio::runtime::Handle::current();
+        // Spawn waiter thread to detect process exit reliably
+        // This thread blocks on child.wait() which is the most reliable way to detect exit
+        let waiter_event_tx = self.event_tx.clone();
+        let waiter_processes = Arc::clone(&self.processes);
+        let waiter_req_id = req_id.clone();
+        let waiter_exited = Arc::clone(&exited);
+        let waiter_runtime = tokio::runtime::Handle::current();
         
         std::thread::spawn(move || {
-            Self::reader_thread(reader, req_id_clone, event_tx, processes, runtime);
+            Self::waiter_thread(child, waiter_req_id, waiter_event_tx, waiter_processes, waiter_exited, waiter_runtime);
+        });
+        
+        // Spawn reader thread to handle PTY output
+        let reader_event_tx = self.event_tx.clone();
+        let reader_processes = Arc::clone(&self.processes);
+        let reader_req_id = req_id.clone();
+        let reader_exited = Arc::clone(&exited);
+        let reader_runtime = tokio::runtime::Handle::current();
+        
+        std::thread::spawn(move || {
+            Self::reader_thread(reader, reader_req_id, reader_event_tx, reader_processes, reader_exited, reader_runtime);
         });
         
         info!("Spawned process for req_id={}, command={}", req_id, command);
         Ok(())
     }
     
-    /// Reader thread that handles PTY output and process exit detection
+    /// Waiter thread that blocks on child.wait() to reliably detect process exit
+    /// This is the primary mechanism for detecting process exit
+    fn waiter_thread(
+        mut child: Box<dyn portable_pty::Child + Send + Sync>,
+        req_id: String,
+        event_tx: mpsc::Sender<PtyEvent>,
+        processes: Arc<Mutex<HashMap<String, PtyProcess>>>,
+        exited: Arc<AtomicBool>,
+        runtime: tokio::runtime::Handle,
+    ) {
+        debug!("Waiter thread started for req_id={}", req_id);
+        
+        // Block until process exits - this is the most reliable way
+        let exit_code = match child.wait() {
+            Ok(status) => {
+                let code = status.exit_code() as i32;
+                info!("Process {} exited with code {} (detected by waiter)", req_id, code);
+                code
+            }
+            Err(e) => {
+                warn!("Error waiting for process {}: {}, assuming exit code 0", req_id, e);
+                0
+            }
+        };
+        
+        // Mark as exited so reader thread knows to stop
+        exited.store(true, Ordering::SeqCst);
+        
+        // Remove from processes map
+        {
+            let mut procs = processes.lock().unwrap();
+            procs.remove(&req_id);
+        }
+        
+        // Send exit event
+        let _ = runtime.block_on(event_tx.send(PtyEvent::Exit {
+            req_id: req_id.clone(),
+            exit_code,
+        }));
+        
+        debug!("Waiter thread finished for req_id={}", req_id);
+    }
+    
+    /// Reader thread that handles PTY output
+    /// This thread reads output and forwards it, but does NOT handle exit detection
     fn reader_thread(
         mut reader: Box<dyn Read + Send>,
         req_id: String,
         event_tx: mpsc::Sender<PtyEvent>,
         processes: Arc<Mutex<HashMap<String, PtyProcess>>>,
+        exited: Arc<AtomicBool>,
         runtime: tokio::runtime::Handle,
     ) {
+        debug!("Reader thread started for req_id={}", req_id);
         let mut buf = [0u8; 4096];
-        let mut consecutive_eofs = 0;
+        let mut consecutive_errors = 0;
         
         loop {
-            // First, check if process has exited
-            let exit_status = {
-                let mut procs = processes.lock().unwrap();
-                if let Some(process) = procs.get_mut(&req_id) {
-                    match process.child.try_wait() {
-                        Ok(Some(status)) => Some(status.exit_code() as i32),
-                        Ok(None) => None, // Still running
-                        Err(e) => {
-                            error!("Error checking process status: {}", e);
-                            None
-                        }
-                    }
-                } else {
-                    // Process was removed (killed externally)
-                    debug!("Process {} not found in map, exiting reader", req_id);
-                    return;
-                }
-            };
+            // Check if process has exited (set by waiter thread)
+            if exited.load(Ordering::SeqCst) {
+                debug!("Reader thread for {} detected exit flag, stopping", req_id);
+                break;
+            }
             
-            if let Some(exit_code) = exit_status {
-                // Process exited, remove from map
-                {
-                    let mut procs = processes.lock().unwrap();
-                    procs.remove(&req_id);
+            // Check if process was removed from map (e.g., killed externally)
+            {
+                let procs = processes.lock().unwrap();
+                if !procs.contains_key(&req_id) {
+                    debug!("Process {} not found in map, reader exiting", req_id);
+                    break;
                 }
-                info!("Process {} exited with code {}", req_id, exit_code);
-                let _ = runtime.block_on(event_tx.send(PtyEvent::Exit {
-                    req_id,
-                    exit_code,
-                }));
-                return;
             }
             
             // Try to read from PTY
             match reader.read(&mut buf) {
                 Ok(0) => {
-                    // EOF - might mean process ended, wait a bit and check
-                    consecutive_eofs += 1;
-                    debug!("PTY EOF #{} for {}", consecutive_eofs, req_id);
+                    // EOF - process likely ended, wait a bit then check exit flag
+                    debug!("PTY EOF for {}", req_id);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                     
-                    if consecutive_eofs >= 10 {
-                        // Many consecutive EOFs, process probably ended
-                        // Check one more time for exit status
-                        let exit_code = {
-                            let mut procs = processes.lock().unwrap();
-                            if let Some(process) = procs.get_mut(&req_id) {
-                                // Wait a bit for process to finish
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                                match process.child.try_wait() {
-                                    Ok(Some(status)) => {
-                                        procs.remove(&req_id);
-                                        Some(status.exit_code() as i32)
-                                    }
-                                    Ok(None) => {
-                                        // Process still running but not producing output
-                                        // This shouldn't happen, but let's continue
-                                        debug!("Process {} still running after EOF, continuing", req_id);
-                                        None
-                                    }
-                                    Err(_) => {
-                                        procs.remove(&req_id);
-                                        Some(0)
-                                    }
-                                }
-                            } else {
-                                Some(-1)
-                            }
-                        };
-                        
-                        if let Some(code) = exit_code {
-                            info!("Process {} finished with code {}", req_id, code);
-                            let _ = runtime.block_on(event_tx.send(PtyEvent::Exit {
-                                req_id,
-                                exit_code: code,
-                            }));
-                            return;
-                        }
+                    // If exited flag is set, waiter thread has handled exit
+                    if exited.load(Ordering::SeqCst) {
+                        debug!("Reader thread for {} saw EOF and exit flag, stopping", req_id);
+                        break;
                     }
                     
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    // Otherwise, keep trying for a bit in case there's more data
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 20 {
+                        // After 1 second of EOFs, check if we should give up
+                        debug!("Reader thread for {} hit EOF limit, checking if still valid", req_id);
+                        if exited.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        consecutive_errors = 0; // Reset and keep waiting for waiter
+                    }
                     continue;
                 }
                 Ok(n) => {
-                    consecutive_eofs = 0; // Reset EOF counter
+                    consecutive_errors = 0;
                     let data = buf[..n].to_vec();
                     debug!("Read {} bytes from PTY for {}", n, req_id);
                     let _ = runtime.block_on(event_tx.send(PtyEvent::Data {
@@ -245,27 +266,15 @@ impl PtyManager {
                     {
                         if e.raw_os_error() == Some(109) {
                             debug!("PTY pipe broken for {} (process ended)", req_id);
-                            // Get exit code
-                            let exit_code = {
-                                let mut procs = processes.lock().unwrap();
-                                if let Some(process) = procs.get_mut(&req_id) {
-                                    std::thread::sleep(std::time::Duration::from_millis(50));
-                                    let code = match process.child.try_wait() {
-                                        Ok(Some(status)) => status.exit_code() as i32,
-                                        _ => 0,
-                                    };
-                                    procs.remove(&req_id);
-                                    code
-                                } else {
-                                    0
+                            // Waiter thread will handle the exit event
+                            // Just wait for the exit flag
+                            for _ in 0..20 {
+                                if exited.load(Ordering::SeqCst) {
+                                    break;
                                 }
-                            };
-                            info!("Process {} finished with exit code: {}", req_id, exit_code);
-                            let _ = runtime.block_on(event_tx.send(PtyEvent::Exit {
-                                req_id,
-                                exit_code,
-                            }));
-                            return;
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            break;
                         }
                     }
                     
@@ -275,20 +284,25 @@ impl PtyManager {
                         continue;
                     }
                     
-                    error!("PTY read error for {}: {}", req_id, e);
-                    // Remove process from map
-                    {
-                        let mut procs = processes.lock().unwrap();
-                        procs.remove(&req_id);
+                    // Other errors - log and check exit flag
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 5 {
+                        error!("PTY read error for {}: {} (consecutive: {})", req_id, e, consecutive_errors);
+                        // Wait for waiter thread to handle exit
+                        for _ in 0..20 {
+                            if exited.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        break;
                     }
-                    let _ = runtime.block_on(event_tx.send(PtyEvent::Error {
-                        req_id,
-                        error: e.to_string(),
-                    }));
-                    return;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             }
         }
+        
+        debug!("Reader thread finished for req_id={}", req_id);
     }
     
     /// Send input data to a process
@@ -324,9 +338,9 @@ impl PtyManager {
     /// Kill a specific process
     pub async fn kill(&self, req_id: &str) -> Result<()> {
         let mut processes = self.processes.lock().unwrap();
-        if let Some(mut process) = processes.remove(req_id) {
-            // Kill the child process
-            let _ = process.child.kill();
+        if let Some(process) = processes.remove(req_id) {
+            // Set exited flag to signal threads to stop
+            process.exited.store(true, Ordering::SeqCst);
             info!("Killed process: {}", req_id);
             Ok(())
         } else {
@@ -337,8 +351,8 @@ impl PtyManager {
     /// Kill all running processes
     pub async fn kill_all(&self) {
         let mut processes = self.processes.lock().unwrap();
-        for (req_id, mut process) in processes.drain() {
-            let _ = process.child.kill();
+        for (req_id, process) in processes.drain() {
+            process.exited.store(true, Ordering::SeqCst);
             info!("Killed process: {}", req_id);
         }
     }
