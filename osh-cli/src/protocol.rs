@@ -284,10 +284,38 @@ pub fn decode_payload(payload: &str) -> anyhow::Result<Vec<u8>> {
 
 /// Helper to decode base64 payload and filter problematic escape sequences
 /// from Windows Terminal / PowerShell that break Linux terminals
+/// Decode and unescape payload from daemon (handles \x1b -> ESC conversion)
 pub fn decode_and_filter_payload(payload: &str) -> anyhow::Result<Vec<u8>> {
     use base64::Engine;
     let data = base64::engine::general_purpose::STANDARD.decode(payload)?;
-    Ok(filter_terminal_sequences(&data))
+    let unescaped = unescape_control_chars(&data);
+    let filtered = filter_terminal_sequences(&unescaped);
+    Ok(filtered)
+}
+
+/// Unescape control characters (\x1b -> ESC, \xNN -> byte)
+fn unescape_control_chars(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(data.len());
+    let mut i = 0;
+    
+    while i < data.len() {
+        // Check for \x escape sequence
+        if data[i] == b'\\' && i + 3 < data.len() && data[i + 1] == b'x' {
+            let hex_str = std::str::from_utf8(&data[i+2..i+4]);
+            if let Ok(hex) = hex_str {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    result.push(byte);
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        
+        result.push(data[i]);
+        i += 1;
+    }
+    
+    result
 }
 
 /// Filter out problematic terminal escape sequences
@@ -322,6 +350,9 @@ fn try_filter_escape_sequence(data: &[u8]) -> Option<usize> {
     match data[1] {
         b'[' => try_filter_csi(data),
         b']' => try_filter_osc(data),
+        b'=' => try_filter_osc(data),
+        b'>' => try_filter_osc(data),
+        b'#' => try_filter_dec(data),
         _ => None,
     }
 }
@@ -336,14 +367,15 @@ fn try_filter_csi(data: &[u8]) -> Option<usize> {
     let has_question = data[i] == b'?';
     let has_gt = data[i] == b'>';
     let has_eq = data[i] == b'=';
+    let has_hash = data[i] == b'#';
     
-    if has_question || has_gt || has_eq {
+    if has_question || has_gt || has_eq || has_hash {
         i += 1;
     }
     
     // Collect the sequence until we find the final byte (0x40-0x7e)
     let start = i;
-    while i < data.len() && (data[i].is_ascii_digit() || data[i] == b';') {
+    while i < data.len() && (data[i].is_ascii_digit() || data[i] == b';' || data[i] == b':') {
         i += 1;
     }
     
@@ -360,50 +392,89 @@ fn try_filter_csi(data: &[u8]) -> Option<usize> {
     let params_str = std::str::from_utf8(&data[start..i]).unwrap_or("");
     
     // Decide what to filter
-    if has_question {
-        // DEC private modes
-        match final_byte {
-            b'h' | b'l' => {
-                // Filter problematic modes
+    // Most terminal control sequences are for cursor/display manipulation
+    // We want to keep only text content
+    match final_byte {
+        // Cursor movement - filter all
+        b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'G' | b'H' | b'd' | b'e' | b'f' 
+        // Erase operations - filter all
+        | b'J' | b'K' | b'P' | b'S' | b'T' | b'X' | b'@'
+        // Scrolling - filter all
+        | b'r' | b'M' | b'L'
+        // Tab operations - filter all
+        | b'g' | b'0' | b'2'
+        // Display attributes - filter all (colors, bold, etc)
+        | b'm'
+        // Soft reset - filter all
+        | b'p'
+        // Save/Restore cursor - filter all
+        | b'u' | b's' | b'7' | b'8' => {
+            return Some(seq_len);
+        }
+        // Private/Extended modes - filter most
+        b'h' | b'l' => {
+            if has_question {
+                // DEC private modes
                 for param in params_str.split(';') {
                     match param {
+                        // Filter all problematic DEC modes
                         "9001" |  // Win32 Input Mode
                         "1004" |  // Focus Reporting
                         "1049" |  // Alternate screen buffer
                         "2004" |  // Bracketed paste
-                        "25"      // Cursor visibility (let PowerShell control mess)
+                        "25" |    // Cursor visibility
+                        "1" |     // Application cursor keys
+                        "3" |     // 132-column mode
+                        "4" |     // Smooth scroll
+                        "5" |     // Reverse video
+                        "6" |     // Origin mode
+                        "7" |     // Wraparound
+                        "8" |     // Auto-repeat
+                        "9" |     // Interlace
+                        "12" |    // Start blinking
+                        "1000" |  // Mouse tracking
+                        "1001" |  // Hilite mouse tracking
+                        "1002" |  // Cell motion mouse
+                        "1003" |  // All motion mouse
+                        "1005" |  // Extended mouse
+                        "1006" |  // SGR mouse
+                        "1015" |  // URXVT mouse
+                        "1016" |  // Pixel motion mouse
+                        "1047" |  // Screen switching
+                        "1048"    // Save/Restore cursor
                             => return Some(seq_len),
                         _ => {}
                     }
                 }
-            }
-            _ => {}
-        }
-    } else if has_gt {
-        // xterm modifyOtherKeys etc - filter all
-        return Some(seq_len);
-    } else if has_eq {
-        // Kitty keyboard protocol - filter all
-        return Some(seq_len);
-    } else {
-        // Standard CSI sequences
-        match final_byte {
-            b'J' => {
-                // ED - Erase in Display
-                // Filter \x1b[2J (clear screen) and \x1b[3J (clear scrollback)
-                if params_str == "2" || params_str == "3" || params_str == "" {
-                    return Some(seq_len);
+            } else if has_gt {
+                // xterm modifyOtherKeys - filter all
+                return Some(seq_len);
+            } else if has_eq {
+                // Kitty keyboard protocol - filter all
+                return Some(seq_len);
+            } else {
+                // Standard CSI modes
+                match params_str {
+                    "" | "0" | "00" => return Some(seq_len), // Reset modes
+                    _ => {}
                 }
             }
-            b'H' => {
-                // CUP - Cursor Position
-                // Filter \x1b[H (cursor to home) - often used with clear
-                if params_str.is_empty() || params_str == "1;1" {
-                    return Some(seq_len);
-                }
-            }
-            _ => {}
         }
+        _ => {}
+    }
+    
+    None
+}
+
+/// Try to filter DEC specific sequences (ESC # ...)
+fn try_filter_dec(data: &[u8]) -> Option<usize> {
+    if data.len() < 3 {
+        return None;
+    }
+    
+    // DEC sequence: ESC # <digit>
+    if data[2].is_ascii_digit() {
+        return Some(3);
     }
     
     None
