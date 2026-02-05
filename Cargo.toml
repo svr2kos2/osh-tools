@@ -4,6 +4,7 @@ members = [
     "osh-relay",
     "osh-cli",
     "osh-daemon",
+    "osh-daemon-gui",
 ]
 
 [workspace.package]

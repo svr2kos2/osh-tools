@@ -1,4 +1,4 @@
-//! OSH Daemon
+//! OSH Daemon CLI Entry Point
 //!
 //! Local client for remote command execution.
 //!
@@ -12,15 +12,10 @@
 //! - Execute commands using portable-pty
 //! - Heartbeat (1s ping, 2s timeout)
 
-mod config;
-mod protocol;
-mod pty_manager;
-mod cmd_executor;
-mod daemon;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+use osh_daemon::{init_config, run};
 
 #[derive(Parser)]
 #[command(name = "osh-daemon")]
@@ -59,10 +54,10 @@ async fn main() -> Result<()> {
     
     match cli.command {
         Commands::Init { server, secret } => {
-            config::init_config(server, secret)?;
+            init_config(server, secret)?;
         }
         Commands::Run => {
-            daemon::run().await?;
+            run().await?;
         }
     }
     

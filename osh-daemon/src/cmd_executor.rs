@@ -71,10 +71,18 @@ pub async fn execute_command(
 
 /// Run a command and capture output
 async fn run_command(shell: &str, command: &str) -> Result<(Vec<u8>, Vec<u8>, i32)> {
+    #[cfg(target_os = "windows")]
+    #[allow(unused_imports)]
+    use std::os::windows::process::CommandExt;
+    
     let mut cmd = Command::new(shell);
     
     #[cfg(target_os = "windows")]
     {
+        // Hide the console window by setting CREATE_NO_WINDOW flag
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        
         if shell.to_lowercase().contains("powershell") {
             cmd.arg("-NoLogo");
             cmd.arg("-NoProfile");

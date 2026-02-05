@@ -36,6 +36,13 @@ enum DaemonState {
 
 /// Run the daemon
 pub async fn run() -> Result<()> {
+    let (_tx, rx) = tokio::sync::mpsc::channel::<()>(1);
+    run_with_shutdown(rx).await
+}
+
+/// Run the daemon with shutdown signal support
+/// The shutdown receiver can be used by GUI or other frontends to gracefully stop the daemon
+pub async fn run_with_shutdown(shutdown_rx: tokio::sync::mpsc::Receiver<()>) -> Result<()> {
     info!("Starting osh-daemon...");
     
     // Load configuration
@@ -48,7 +55,7 @@ pub async fn run() -> Result<()> {
     info!("  Platform: {}", DaemonConfig::platform());
     
     // Connect and run
-    let result = connect_and_run(config).await;
+    let result = connect_and_run(config, shutdown_rx).await;
     
     if let Err(ref e) = result {
         error!("Daemon error: {:#}", e);
@@ -58,7 +65,7 @@ pub async fn run() -> Result<()> {
 }
 
 /// Connect to the relay server and run the main loop
-async fn connect_and_run(config: DaemonConfig) -> Result<()> {
+async fn connect_and_run(config: DaemonConfig, mut shutdown_rx: tokio::sync::mpsc::Receiver<()>) -> Result<()> {
     info!("Connecting to {}...", config.server_url);
     
     // Connect to WebSocket
@@ -211,54 +218,64 @@ async fn connect_and_run(config: DaemonConfig) -> Result<()> {
     let main_shell = shell.clone();
     
     loop {
-        let current_state = main_state.read().await.clone();
-        if current_state == DaemonState::Disconnected {
-            info!("Daemon disconnected");
-            break;
-        }
-        
-        // Read message with timeout
-        let read_result = timeout(HEARTBEAT_TIMEOUT, ws_read.next()).await;
-        
-        match read_result {
-            Ok(Some(Ok(msg))) => {
-                // Update last activity
-                *main_last_activity.write().await = Instant::now();
-                
-                // Handle message
-                if let Message::Binary(data) = msg {
-                    if let Err(e) = handle_message(
-                        &data,
-                        &main_state,
-                        &main_pty_manager,
-                        &main_ws_tx,
-                        &main_shell,
-                        &main_cmd_event_tx,
-                    ).await {
-                        error!("Error handling message: {:#}", e);
+        tokio::select! {
+            // Check for shutdown signal
+            _ = shutdown_rx.recv() => {
+                info!("Shutdown signal received");
+                *main_state.write().await = DaemonState::Disconnected;
+                break;
+            }
+            
+            // Read message
+            read_result = async {
+                timeout(HEARTBEAT_TIMEOUT, ws_read.next()).await
+            } => {
+                match read_result {
+                    Ok(Some(Ok(msg))) => {
+                        // Update last activity
+                        *main_last_activity.write().await = Instant::now();
+                        
+                        // Handle message
+                        if let Message::Binary(data) = msg {
+                            if let Err(e) = handle_message(
+                                &data,
+                                &main_state,
+                                &main_pty_manager,
+                                &main_ws_tx,
+                                &main_shell,
+                                &main_cmd_event_tx,
+                            ).await {
+                                error!("Error handling message: {:#}", e);
+                            }
+                        }
+                    }
+                    Ok(Some(Err(e))) => {
+                        error!("WebSocket error: {}", e);
+                        *main_state.write().await = DaemonState::Disconnected;
+                        break;
+                    }
+                    Ok(None) => {
+                        info!("WebSocket closed by server");
+                        *main_state.write().await = DaemonState::Disconnected;
+                        break;
+                    }
+                    Err(_) => {
+                        // Timeout - check if we should continue
+                        let elapsed = main_last_activity.read().await.elapsed();
+                        if elapsed > HEARTBEAT_TIMEOUT {
+                            error!("Read timeout");
+                            *main_state.write().await = DaemonState::Disconnected;
+                            break;
+                        }
                     }
                 }
             }
-            Ok(Some(Err(e))) => {
-                error!("WebSocket error: {}", e);
-                *main_state.write().await = DaemonState::Disconnected;
-                break;
-            }
-            Ok(None) => {
-                info!("WebSocket closed by server");
-                *main_state.write().await = DaemonState::Disconnected;
-                break;
-            }
-            Err(_) => {
-                // Timeout - check if we should continue
-                let elapsed = main_last_activity.read().await.elapsed();
-                if elapsed > HEARTBEAT_TIMEOUT {
-                    error!("Read timeout");
-                    *main_state.write().await = DaemonState::Disconnected;
-                    break;
-                }
-            }
         }
+    }
+    
+    let current_state = main_state.read().await.clone();
+    if current_state == DaemonState::Disconnected {
+        info!("Daemon disconnected");
     }
     
     // Cleanup

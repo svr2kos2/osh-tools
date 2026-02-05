@@ -1,0 +1,40 @@
+[package]
+name = "osh-daemon-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "OSH Daemon GUI - System tray application for OSH daemon"
+
+[[bin]]
+name = "osh-daemon-gui"
+path = "src/main.rs"
+
+[dependencies]
+# Core daemon functionality
+osh-daemon = { path = "../osh-daemon" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# System tray
+tray-icon = "0.14"
+
+# Directory utilities
+dirs = "5.0"
+
+# Windows-specific dependencies
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
+winit = { version = "0.29", features = ["rwh_05"] }

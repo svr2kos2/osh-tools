@@ -6,6 +6,14 @@ authors.workspace = true
 license.workspace = true
 description = "OSH Daemon - Local client for remote command execution"
 
+[lib]
+name = "osh_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "osh-daemon"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
