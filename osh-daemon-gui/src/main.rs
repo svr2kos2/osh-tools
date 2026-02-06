@@ -7,6 +7,7 @@
 //! - Auto-start on Windows
 //! - Run daemon in background
 //! - Configure settings via GUI
+//! - Monitor daemon connection status
 
 #![windows_subsystem = "windows"]
 
@@ -21,33 +22,50 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
 
+/// Connection status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionStatus {
+    /// Daemon not running
+    Disconnected,
+    /// Daemon running but not yet approved
+    Connecting,
+    /// Daemon connected and approved
+    Connected,
+}
+
 /// Application state
 struct AppState {
     daemon_running: bool,
     daemon_handle: Option<tokio::task::JoinHandle<()>>,
     shutdown_tx: Option<tokio::sync::mpsc::Sender<()>>,
+    connection_status: ConnectionStatus,
     runtime: Arc<Runtime>,
 }
 
 fn main() -> Result<()> {
-    // Initialize logging to file
-    let log_dir = dirs::config_dir()
-        .unwrap_or_else(|| std::env::current_dir().unwrap())
-        .join("osh-daemon");
+    // Initialize logging to current directory
+    let log_dir = std::env::current_dir().unwrap().join("logs");
     std::fs::create_dir_all(&log_dir)?;
     
-    let log_file = std::fs::File::create(log_dir.join("gui.log"))?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("gui.log"))?;
+    
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive("osh_daemon_gui=info".parse()?)
+                .add_directive("osh_daemon_gui=debug".parse()?)
                 .add_directive("osh_daemon=info".parse()?)
         )
         .with_writer(Arc::new(log_file))
         .with_ansi(false)
+        .with_thread_ids(true)
+        .with_line_number(true)
         .init();
     
     info!("Starting OSH Daemon GUI...");
+    info!("Log directory: {}", log_dir.display());
     
     // Create tokio runtime for async operations
     let runtime = Arc::new(
@@ -61,31 +79,33 @@ fn main() -> Result<()> {
         daemon_running: false,
         daemon_handle: None,
         shutdown_tx: None,
+        connection_status: ConnectionStatus::Disconnected,
         runtime: Arc::clone(&runtime),
     }));
     
     // Create event loop
     let event_loop = EventLoopBuilder::new().build()?;
     
-    // Load tray icon
-    let icon = load_icon();
-    
     // Create tray menu
     let tray_menu = Menu::new();
     let start_item = MenuItem::new("启动守护进程", true, None);
     let stop_item = MenuItem::new("停止守护进程", false, None);
     let separator = tray_icon::menu::PredefinedMenuItem::separator();
+    let status_item = MenuItem::new("状态: 未连接", false, None);
+    let separator2 = tray_icon::menu::PredefinedMenuItem::separator();
     let config_item = MenuItem::new("配置", true, None);
     let autostart_item = CheckMenuItem::new("开机自启", false, true, None);
-    let separator2 = tray_icon::menu::PredefinedMenuItem::separator();
+    let separator3 = tray_icon::menu::PredefinedMenuItem::separator();
     let quit_item = MenuItem::new("退出", true, None);
     
     tray_menu.append(&start_item)?;
     tray_menu.append(&stop_item)?;
     tray_menu.append(&separator)?;
+    tray_menu.append(&status_item)?;
+    tray_menu.append(&separator2)?;
     tray_menu.append(&config_item)?;
     tray_menu.append(&autostart_item)?;
-    tray_menu.append(&separator2)?;
+    tray_menu.append(&separator3)?;
     tray_menu.append(&quit_item)?;
     
     // Check and set autostart status (ignore errors)
@@ -97,10 +117,10 @@ fn main() -> Result<()> {
     autostart_item.set_enabled(true);
     
     // Create tray icon
-    let _tray_icon = TrayIconBuilder::new()
+    let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
-        .with_tooltip("OSH Daemon")
-        .with_icon(icon)
+        .with_tooltip("OSH Daemon - 未连接")
+        .with_icon(create_icon(ConnectionStatus::Disconnected))
         .build()?;
     
     info!("Tray icon created");
@@ -108,9 +128,48 @@ fn main() -> Result<()> {
     // Handle menu events
     let menu_channel = MenuEvent::receiver();
     let app_state_clone = Arc::clone(&app_state);
+    let tray_icon_rc = std::rc::Rc::new(tray_icon);
+    
+    // Update status periodically - this will run in the event loop
+    let app_state_monitor = Arc::clone(&app_state);
+    let status_item_clone = status_item.clone();
+    let tray_icon_clone = tray_icon_rc.clone();
+    
+    // Pre-spawn the monitor thread before event loop (non-Windows fallback)
+    #[cfg(not(target_os = "windows"))]
+    let _monitor_handle = {
+        let state = Arc::clone(&app_state);
+        std::thread::spawn(move || {
+            monitor_daemon_status(state);
+        })
+    };
+
+    let mut last_status = ConnectionStatus::Disconnected;
     
     event_loop.run(move |_event, event_loop| {
         event_loop.set_control_flow(ControlFlow::Wait);
+        
+        // Update status display only when status changes
+        let state = app_state_monitor.lock().unwrap();
+        if state.connection_status != last_status {
+            let status_text = match state.connection_status {
+                ConnectionStatus::Disconnected => "状态: 未连接",
+                ConnectionStatus::Connecting => "状态: 连接中...",
+                ConnectionStatus::Connected => "状态: 已连接",
+            };
+            
+            let tooltip = match state.connection_status {
+                ConnectionStatus::Disconnected => "OSH Daemon - 未连接",
+                ConnectionStatus::Connecting => "OSH Daemon - 连接中...",
+                ConnectionStatus::Connected => "OSH Daemon - 已连接",
+            };
+            
+            let _ = status_item_clone.set_text(status_text);
+            let _ = tray_icon_clone.set_tooltip(Some(tooltip.to_string()));
+            let _ = tray_icon_clone.set_icon(Some(create_icon(state.connection_status)));
+            last_status = state.connection_status;
+        }
+        drop(state); // Release lock before handling events
         
         // Check for menu events
         if let Ok(event) = menu_channel.try_recv() {
@@ -155,19 +214,24 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Load tray icon
-fn load_icon() -> tray_icon::Icon {
-    // Create a simple icon (16x16 red square for now)
-    // TODO: Replace with actual icon
+/// Create tray icon based on connection status
+fn create_icon(status: ConnectionStatus) -> tray_icon::Icon {
+    // Create a 16x16 icon with different colors based on status
     let width = 16;
     let height = 16;
     let mut rgba = Vec::with_capacity(width * height * 4);
     
+    let (r, g, b) = match status {
+        ConnectionStatus::Disconnected => (255, 64, 64),   // Red
+        ConnectionStatus::Connecting => (255, 165, 0),     // Orange
+        ConnectionStatus::Connected => (100, 200, 100),    // Green
+    };
+    
     for _y in 0..height {
         for _x in 0..width {
-            rgba.push(255); // R
-            rgba.push(64);  // G
-            rgba.push(64);  // B
+            rgba.push(r);  // R
+            rgba.push(g);  // G
+            rgba.push(b);  // B
             rgba.push(255); // A
         }
     }
@@ -186,10 +250,20 @@ fn start_daemon_thread(state: Arc<Mutex<AppState>>) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let state_clone = Arc::clone(&state);
     
-    // Spawn the daemon task
+    // Update status to Connecting
+    {
+        let mut state_guard = state.lock().unwrap();
+        state_guard.connection_status = ConnectionStatus::Connecting;
+    }
+    
+    // Generate a unique pipe name
+    let pipe_name = format!("osh_status_{}", std::process::id());
+    let pipe_name_clone = pipe_name.clone();
+    
+    // Spawn the daemon task with status pipe
     let handle = runtime.spawn(async move {
-        info!("Starting daemon...");
-        match osh_daemon::run_with_shutdown(shutdown_rx).await {
+        info!("Starting daemon with status pipe: {}", pipe_name_clone);
+        match osh_daemon::run_with_shutdown(shutdown_rx, Some(pipe_name_clone)).await {
             Ok(_) => info!("Daemon stopped normally"),
             Err(e) => error!("Daemon error: {:#}", e),
         }
@@ -199,14 +273,203 @@ fn start_daemon_thread(state: Arc<Mutex<AppState>>) -> Result<()> {
         state.daemon_running = false;
         state.daemon_handle = None;
         state.shutdown_tx = None;
+        state.connection_status = ConnectionStatus::Disconnected;
     });
     
-    let mut state = state.lock().unwrap();
-    state.daemon_running = true;
-    state.daemon_handle = Some(handle);
-    state.shutdown_tx = Some(shutdown_tx);
+    let mut state_guard = state.lock().unwrap();
+    state_guard.daemon_running = true;
+    state_guard.daemon_handle = Some(handle);
+    state_guard.shutdown_tx = Some(shutdown_tx);
+    drop(state_guard); // Release the lock before calling listen_status_pipe
+    
+    // Spawn the IPC pipe listener
+    listen_status_pipe(Arc::clone(&state), pipe_name);
     
     Ok(())
+}
+
+/// Listen on IPC named pipe for status updates from daemon
+#[cfg(target_os = "windows")]
+fn listen_status_pipe(state: Arc<Mutex<AppState>>, pipe_name: String) {
+    let runtime = {
+        let state = state.lock().unwrap();
+        Arc::clone(&state.runtime)
+    };
+
+    runtime.spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::net::windows::named_pipe::ServerOptions;
+        use std::time::Duration;
+
+        info!("Status pipe server starting for pipe: {}", pipe_name);
+        let pipe_path = format!(r"\\.\pipe\{}", pipe_name);
+
+        loop {
+            let server = match ServerOptions::new().create(&pipe_path) {
+                Ok(server) => server,
+                Err(e) => {
+                    error!("Failed to create status pipe server: {}", e);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
+
+            info!("Waiting for daemon to connect to status pipe: {}", pipe_name);
+            if let Err(e) = server.connect().await {
+                warn!("Failed to accept status pipe connection: {}", e);
+                continue;
+            }
+
+            info!("Daemon connected to status pipe: {}", pipe_name);
+
+            let mut reader = BufReader::new(server);
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => {
+                        info!("Status pipe disconnected");
+                        break;
+                    }
+                    Ok(_) => {
+                        let status = line.trim();
+
+                        let new_status = match status {
+                            "CONNECTED" => {
+                                info!("Received CONNECTED status");
+                                ConnectionStatus::Connected
+                            }
+                            "CONNECTING" | "WAITING" => {
+                                info!("Received {} status", status);
+                                ConnectionStatus::Connecting
+                            }
+                            "RECONNECTING" => {
+                                info!("Received RECONNECTING status");
+                                ConnectionStatus::Connecting
+                            }
+                            "STOPPED" => {
+                                info!("Received STOPPED status");
+                                ConnectionStatus::Disconnected
+                            }
+                            "REJECTED" | "AUTH_FAILED" | "LIMIT_EXCEEDED" => {
+                                warn!("Received error status: {}", status);
+                                ConnectionStatus::Disconnected
+                            }
+                            _ => {
+                                warn!("Unknown status: {}", status);
+                                continue;
+                            }
+                        };
+
+                        let mut state = state.lock().unwrap();
+                        if state.daemon_running {
+                            state.connection_status = new_status;
+                        } else {
+                            info!("Daemon not running, exiting status pipe listener");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed reading status pipe: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            let state = state.lock().unwrap();
+            if !state.daemon_running {
+                info!("Daemon stopped, exiting status pipe listener");
+                break;
+            }
+        }
+
+        info!("Status pipe listener task exited");
+    });
+}
+
+/// Listen on IPC named pipe for status updates from daemon (no-op on non-Windows)
+#[cfg(not(target_os = "windows"))]
+fn listen_status_pipe(_state: Arc<Mutex<AppState>>, _pipe_name: String) {
+    // Fall back to log file monitoring on non-Windows platforms
+}
+
+/// Monitor daemon status by reading log file
+#[cfg(not(target_os = "windows"))]
+fn monitor_daemon_status(state: Arc<Mutex<AppState>>) {
+    let log_path = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("logs")
+        .join("gui.log");
+    
+    let mut last_modified = std::time::SystemTime::now();
+    let mut connected = false;
+    
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        
+        // Check if daemon is still running
+        {
+            let state = state.lock().unwrap();
+            if !state.daemon_running {
+                connected = false;
+                break;
+            }
+        }
+        
+        // Try to read log file
+        if let Ok(metadata) = std::fs::metadata(&log_path) {
+            if let Ok(modified) = metadata.modified() {
+                if modified > last_modified {
+                    last_modified = modified;
+                    
+                    // Read file and look for status indicators
+                    if let Ok(content) = std::fs::read_to_string(&log_path) {
+                        let lines: Vec<&str> = content.lines().collect();
+                        
+                        // Scan from the end for the most recent status
+                        for line in lines.iter().rev().take(200) {
+                            // Connected indicators - check these first (more recent = more relevant)
+                            if line.contains("Pairing approved") {
+                                if !connected {
+                                    connected = true;
+                                    let mut state = state.lock().unwrap();
+                                    state.connection_status = ConnectionStatus::Connected;
+                                }
+                                break;
+                            }
+                            // Pending/Connecting indicators
+                            if line.contains("Pairing pending") || line.contains("Waiting for admin approval") {
+                                if connected {
+                                    connected = false;
+                                    let mut state = state.lock().unwrap();
+                                    state.connection_status = ConnectionStatus::Connecting;
+                                }
+                                break;
+                            }
+                            // Reconnecting indicators
+                            if line.contains("Reconnecting") || line.contains("Heartbeat timeout") {
+                                if connected {
+                                    connected = false;
+                                    let mut state = state.lock().unwrap();
+                                    state.connection_status = ConnectionStatus::Connecting;
+                                }
+                                break;
+                            }
+                            // Sent pairing request (initial connection)
+                            if line.contains("Sent pairing request") {
+                                if !connected && !matches!(state.lock().unwrap().connection_status, ConnectionStatus::Connected) {
+                                    let mut state = state.lock().unwrap();
+                                    state.connection_status = ConnectionStatus::Connecting;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Stop the daemon

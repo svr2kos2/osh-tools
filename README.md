@@ -135,3 +135,41 @@ Releases are automatically created via GitHub Actions when a new tag is pushed. 
 - Required repository configuration
 
 See [RELEASE.md](RELEASE.md) for detailed instructions.
+## 📊 Logging and Debugging
+
+OSH Daemon now includes a comprehensive logging system for debugging and troubleshooting:
+
+### Quick Start
+- **New User?** Start with [QUICK_START_LOGGING.md](QUICK_START_LOGGING.md) (5 min)
+- **Windows User?** Use [WINDOWS_QUICK_REFERENCE.md](WINDOWS_QUICK_REFERENCE.md)
+- **Need Help?** See [DOCS_INDEX.md](DOCS_INDEX.md)
+
+### Key Features
+- ✅ File-based logging for daemon and GUI
+- ✅ Automatic log rotation (daily)
+- ✅ Complete connection state tracking
+- ✅ Reconnection attempt logging
+- ✅ IPC (named pipe) communication visibility
+- ✅ Structured debug output
+
+### Enable Logging
+```bash
+# Daemon with logging
+osh-daemon run --log
+
+# View logs
+tail -f logs/daemon.log
+tail -f logs/gui.log
+```
+
+### Documentation
+| Document | Purpose | Time |
+|----------|---------|------|
+| [QUICK_START_LOGGING.md](QUICK_START_LOGGING.md) | Quick start guide | 5 min |
+| [LOGGING_GUIDE.md](LOGGING_GUIDE.md) | Complete reference | 20 min |
+| [WINDOWS_QUICK_REFERENCE.md](WINDOWS_QUICK_REFERENCE.md) | Windows command cheat sheet | Quick |
+| [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md) | Technical details | 15 min |
+| [TEST_LOGGING.md](TEST_LOGGING.md) | Testing guide | 10 min |
+| [VERIFICATION_CHECKLIST.md](VERIFICATION_CHECKLIST.md) | Verification checklist | 10 min |
+| [FINAL_SUMMARY.md](FINAL_SUMMARY.md) | Complete overview | 15 min |
+| [DOCS_INDEX.md](DOCS_INDEX.md) | Document index | Quick |

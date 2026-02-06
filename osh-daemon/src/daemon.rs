@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, timeout};
+use tokio::time::{interval, timeout, sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
@@ -24,6 +24,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// Heartbeat timeout
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Reconnection retry strategies
+const RECONNECT_FAST_ATTEMPTS: usize = 3;
+const RECONNECT_FAST_INTERVAL: Duration = Duration::from_secs(10);
+const RECONNECT_MEDIUM_ATTEMPTS: usize = 10;
+const RECONNECT_MEDIUM_INTERVAL: Duration = Duration::from_secs(60);
+const RECONNECT_SLOW_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
+
 /// Daemon state
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DaemonState {
@@ -32,17 +39,63 @@ enum DaemonState {
     WaitingForPairing,
     Approved,
     Disconnected,
+    ShuttingDown,
+}
+
+/// Disconnect reason
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DisconnectReason {
+    /// User requested shutdown
+    UserInitiated,
+    /// Heartbeat timeout
+    HeartbeatTimeout,
+    /// WebSocket error
+    WebSocketError,
+    /// Server closed connection
+    ServerClosed,
+    /// Other reason
+    Other,
+}
+
+/// Send status update through IPC pipe (Windows named pipe)
+#[cfg(target_os = "windows")]
+async fn send_status_update(pipe_name: &str, status: &str) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let pipe_path = format!(r"\\.\pipe\{}", pipe_name);
+    debug!("Sending status '{}' to pipe '{}'", status, pipe_path);
+
+    match ClientOptions::new().open(&pipe_path) {
+        Ok(mut pipe) => {
+            if let Err(e) = pipe.write_all(status.as_bytes()).await {
+                warn!("Failed to write status to pipe: {}", e);
+                return;
+            }
+            if let Err(e) = pipe.write_all(b"\n").await {
+                warn!("Failed to write status newline to pipe: {}", e);
+                return;
+            }
+            debug!("Status '{}' sent to pipe", status);
+        }
+        Err(e) => debug!("Failed to open pipe for status update: {}", e),
+    }
+}
+
+/// Send status update (no-op on non-Windows platforms)
+#[cfg(not(target_os = "windows"))]
+async fn send_status_update(_pipe_name: &str, _status: &str) {
 }
 
 /// Run the daemon
-pub async fn run() -> Result<()> {
+pub async fn run(status_pipe: Option<String>) -> Result<()> {
     let (_tx, rx) = tokio::sync::mpsc::channel::<()>(1);
-    run_with_shutdown(rx).await
+    run_with_shutdown(rx, status_pipe).await
 }
 
 /// Run the daemon with shutdown signal support
 /// The shutdown receiver can be used by GUI or other frontends to gracefully stop the daemon
-pub async fn run_with_shutdown(shutdown_rx: tokio::sync::mpsc::Receiver<()>) -> Result<()> {
+pub async fn run_with_shutdown(shutdown_rx: tokio::sync::mpsc::Receiver<()>, status_pipe: Option<String>) -> Result<()> {
     info!("Starting osh-daemon...");
     
     // Load configuration
@@ -54,24 +107,97 @@ pub async fn run_with_shutdown(shutdown_rx: tokio::sync::mpsc::Receiver<()>) -> 
     info!("  Shell: {}", config.effective_shell());
     info!("  Platform: {}", DaemonConfig::platform());
     
-    // Connect and run
-    let result = connect_and_run(config, shutdown_rx).await;
+    // Create broadcast channel for shutdown signal across reconnection attempts
+    let (shutdown_broadcast_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     
-    if let Err(ref e) = result {
-        error!("Daemon error: {:#}", e);
+    // Forward external shutdown signal to broadcast channel
+    let broadcast_tx = shutdown_broadcast_tx.clone();
+    let mut rx = shutdown_rx;
+    tokio::spawn(async move {
+        if rx.recv().await.is_some() {
+            let _ = broadcast_tx.send(());
+        }
+    });
+    
+    // Reconnection loop
+    let mut reconnect_count = 0;
+    loop {
+        let config_clone = config.clone();
+        let broadcast_tx = shutdown_broadcast_tx.clone();
+        let status_pipe_clone = status_pipe.clone();
+        
+        // Send connecting status
+        if let Some(ref pipe) = status_pipe {
+            send_status_update(pipe, "CONNECTING").await;
+        }
+        
+        // Connect and run
+        let (result, reason) = connect_and_run_inner(config_clone, broadcast_tx, status_pipe_clone).await;
+        
+        match reason {
+            DisconnectReason::UserInitiated => {
+                info!("Daemon stopped by user");
+                if let Some(ref pipe) = status_pipe {
+                    send_status_update(pipe, "STOPPED").await;
+                }
+                return result;
+            }
+            DisconnectReason::HeartbeatTimeout => {
+                warn!("Disconnected due to heartbeat timeout");
+                reconnect_count += 1;
+                
+                let (wait_duration, stage) = if reconnect_count <= RECONNECT_FAST_ATTEMPTS {
+                    (RECONNECT_FAST_INTERVAL, "fast")
+                } else if reconnect_count <= RECONNECT_FAST_ATTEMPTS + RECONNECT_MEDIUM_ATTEMPTS {
+                    (RECONNECT_MEDIUM_INTERVAL, "medium")
+                } else {
+                    (RECONNECT_SLOW_INTERVAL, "slow")
+                };
+                
+                info!("Reconnecting (attempt {}, stage: {})... waiting {:?}", reconnect_count, stage, wait_duration);
+                if let Some(ref pipe) = status_pipe {
+                    send_status_update(pipe, "RECONNECTING").await;
+                }
+                sleep(wait_duration).await;
+            }
+            _ => {
+                warn!("Disconnected due to: {:?}", reason);
+                reconnect_count += 1;
+                
+                let (wait_duration, stage) = if reconnect_count <= RECONNECT_FAST_ATTEMPTS {
+                    (RECONNECT_FAST_INTERVAL, "fast")
+                } else if reconnect_count <= RECONNECT_FAST_ATTEMPTS + RECONNECT_MEDIUM_ATTEMPTS {
+                    (RECONNECT_MEDIUM_INTERVAL, "medium")
+                } else {
+                    (RECONNECT_SLOW_INTERVAL, "slow")
+                };
+                
+                info!("Reconnecting (attempt {}, stage: {})... waiting {:?}", reconnect_count, stage, wait_duration);
+                if let Some(ref pipe) = status_pipe {
+                    send_status_update(pipe, "RECONNECTING").await;
+                }
+                sleep(wait_duration).await;
+            }
+        }
     }
-    
-    result
 }
 
 /// Connect to the relay server and run the main loop
-async fn connect_and_run(config: DaemonConfig, mut shutdown_rx: tokio::sync::mpsc::Receiver<()>) -> Result<()> {
+/// Returns (result, disconnect_reason)
+async fn connect_and_run_inner(config: DaemonConfig, shutdown_broadcast_tx: tokio::sync::broadcast::Sender<()>, status_pipe: Option<String>) -> (Result<()>, DisconnectReason) {
     info!("Connecting to {}...", config.server_url);
     
+    // Create shutdown receiver for this connection attempt
+    let mut shutdown_rx = shutdown_broadcast_tx.subscribe();
+    
     // Connect to WebSocket
-    let (ws_stream, _) = connect_async(&config.server_url)
-        .await
-        .context("Failed to connect to relay server")?;
+    let (ws_stream, _) = match connect_async(&config.server_url).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            error!("Failed to connect to relay server: {}", e);
+            return (Err(anyhow::anyhow!("Connection failed: {}", e)), DisconnectReason::WebSocketError);
+        }
+    };
     
     info!("Connected to relay server");
     
@@ -87,8 +213,16 @@ async fn connect_and_run(config: DaemonConfig, mut shutdown_rx: tokio::sync::mps
         config.secret_key.clone(),
     );
     
-    let msg = serde_json::to_vec(&pair_request)?;
-    ws_write.send(Message::Binary(msg.into())).await?;
+    let msg = match serde_json::to_vec(&pair_request) {
+        Ok(msg) => msg,
+        Err(e) => {
+            return (Err(anyhow::anyhow!("Failed to serialize pairing request: {}", e)), DisconnectReason::Other);
+        }
+    };
+    
+    if let Err(e) = ws_write.send(Message::Binary(msg.into())).await {
+        return (Err(anyhow::anyhow!("Failed to send pairing request: {}", e)), DisconnectReason::WebSocketError);
+    }
     info!("Sent pairing request");
     
     // Create channels
@@ -105,11 +239,13 @@ async fn connect_and_run(config: DaemonConfig, mut shutdown_rx: tokio::sync::mps
     // State
     let state = Arc::new(RwLock::new(DaemonState::WaitingForPairing));
     let last_activity = Arc::new(RwLock::new(Instant::now()));
+    let disconnect_reason = Arc::new(RwLock::new(DisconnectReason::Other));
     
     // Heartbeat task
     let heartbeat_state = Arc::clone(&state);
     let heartbeat_last_activity = Arc::clone(&last_activity);
     let heartbeat_ws_tx = ws_send_tx.clone();
+    let heartbeat_disconnect_reason = Arc::clone(&disconnect_reason);
     let heartbeat_handle = tokio::spawn(async move {
         let mut heartbeat_interval = interval(HEARTBEAT_INTERVAL);
         
@@ -118,7 +254,7 @@ async fn connect_and_run(config: DaemonConfig, mut shutdown_rx: tokio::sync::mps
             
             // Check state
             let current_state = heartbeat_state.read().await.clone();
-            if current_state == DaemonState::Disconnected {
+            if current_state == DaemonState::Disconnected || current_state == DaemonState::ShuttingDown {
                 break;
             }
             
@@ -127,6 +263,7 @@ async fn connect_and_run(config: DaemonConfig, mut shutdown_rx: tokio::sync::mps
             if elapsed > HEARTBEAT_TIMEOUT {
                 error!("Heartbeat timeout! No activity for {:?}", elapsed);
                 *heartbeat_state.write().await = DaemonState::Disconnected;
+                *heartbeat_disconnect_reason.write().await = DisconnectReason::HeartbeatTimeout;
                 break;
             }
             
@@ -216,13 +353,15 @@ async fn connect_and_run(config: DaemonConfig, mut shutdown_rx: tokio::sync::mps
     let main_ws_tx = ws_send_tx.clone();
     let main_cmd_event_tx = cmd_event_tx.clone();
     let main_shell = shell.clone();
+    let main_disconnect_reason = Arc::clone(&disconnect_reason);
     
     loop {
         tokio::select! {
             // Check for shutdown signal
             _ = shutdown_rx.recv() => {
                 info!("Shutdown signal received");
-                *main_state.write().await = DaemonState::Disconnected;
+                *main_state.write().await = DaemonState::ShuttingDown;
+                *main_disconnect_reason.write().await = DisconnectReason::UserInitiated;
                 break;
             }
             
@@ -244,6 +383,7 @@ async fn connect_and_run(config: DaemonConfig, mut shutdown_rx: tokio::sync::mps
                                 &main_ws_tx,
                                 &main_shell,
                                 &main_cmd_event_tx,
+                                status_pipe.as_deref(),
                             ).await {
                                 error!("Error handling message: {:#}", e);
                             }
@@ -252,11 +392,13 @@ async fn connect_and_run(config: DaemonConfig, mut shutdown_rx: tokio::sync::mps
                     Ok(Some(Err(e))) => {
                         error!("WebSocket error: {}", e);
                         *main_state.write().await = DaemonState::Disconnected;
+                        *main_disconnect_reason.write().await = DisconnectReason::WebSocketError;
                         break;
                     }
                     Ok(None) => {
                         info!("WebSocket closed by server");
                         *main_state.write().await = DaemonState::Disconnected;
+                        *main_disconnect_reason.write().await = DisconnectReason::ServerClosed;
                         break;
                     }
                     Err(_) => {
@@ -265,6 +407,7 @@ async fn connect_and_run(config: DaemonConfig, mut shutdown_rx: tokio::sync::mps
                         if elapsed > HEARTBEAT_TIMEOUT {
                             error!("Read timeout");
                             *main_state.write().await = DaemonState::Disconnected;
+                            *main_disconnect_reason.write().await = DisconnectReason::HeartbeatTimeout;
                             break;
                         }
                     }
@@ -274,7 +417,7 @@ async fn connect_and_run(config: DaemonConfig, mut shutdown_rx: tokio::sync::mps
     }
     
     let current_state = main_state.read().await.clone();
-    if current_state == DaemonState::Disconnected {
+    if current_state == DaemonState::Disconnected || current_state == DaemonState::ShuttingDown {
         info!("Daemon disconnected");
     }
     
@@ -291,7 +434,9 @@ async fn connect_and_run(config: DaemonConfig, mut shutdown_rx: tokio::sync::mps
     ws_send_handle.abort();
     
     info!("Daemon stopped");
-    Ok(())
+    
+    let final_reason = disconnect_reason.read().await.clone();
+    (Ok(()), final_reason)
 }
 
 /// Handle an incoming message
@@ -302,6 +447,7 @@ async fn handle_message(
     ws_tx: &mpsc::Sender<Message>,
     shell: &str,
     cmd_event_tx: &mpsc::Sender<CmdEvent>,
+    status_pipe: Option<&str>,
 ) -> Result<()> {
     // Parse as generic message
     let msg: GenericMessage = serde_json::from_slice(data)
@@ -324,7 +470,7 @@ async fn handle_message(
     
     // Handle pairing responses
     if msg.is_pair_response() {
-        handle_pair_response(&msg, state).await?;
+        handle_pair_response(&msg, state, status_pipe).await?;
         return Ok(());
     }
     
@@ -346,11 +492,15 @@ async fn handle_message(
 async fn handle_pair_response(
     msg: &GenericMessage,
     state: &Arc<RwLock<DaemonState>>,
+    status_pipe: Option<&str>,
 ) -> Result<()> {
     match msg.msg_type.as_str() {
         "PAIR_APPROVED" => {
             info!("Pairing approved! Ready to receive commands.");
             *state.write().await = DaemonState::Approved;
+            if let Some(pipe) = status_pipe {
+                send_status_update(pipe, "CONNECTED").await;
+            }
         }
         "PAIR_PENDING" => {
             info!("Pairing pending. Waiting for admin approval...");
@@ -358,6 +508,9 @@ async fn handle_pair_response(
                 info!("Server message: {}", message);
             }
             *state.write().await = DaemonState::WaitingForPairing;
+            if let Some(pipe) = status_pipe {
+                send_status_update(pipe, "WAITING").await;
+            }
         }
         "PAIR_REJECTED" => {
             error!("Pairing rejected by server.");
@@ -365,6 +518,9 @@ async fn handle_pair_response(
                 error!("Reason: {}", message);
             }
             *state.write().await = DaemonState::Disconnected;
+            if let Some(pipe) = status_pipe {
+                send_status_update(pipe, "REJECTED").await;
+            }
             anyhow::bail!("Pairing rejected");
         }
         "PAIR_AUTH_FAILED" => {
@@ -373,6 +529,9 @@ async fn handle_pair_response(
                 error!("Server message: {}", message);
             }
             *state.write().await = DaemonState::Disconnected;
+            if let Some(pipe) = status_pipe {
+                send_status_update(pipe, "AUTH_FAILED").await;
+            }
             anyhow::bail!("Authentication failed");
         }
         "PAIR_LIMIT_EXCEEDED" => {
@@ -381,6 +540,9 @@ async fn handle_pair_response(
                 error!("Server message: {}", message);
             }
             *state.write().await = DaemonState::Disconnected;
+            if let Some(pipe) = status_pipe {
+                send_status_update(pipe, "LIMIT_EXCEEDED").await;
+            }
             anyhow::bail!("Device limit exceeded");
         }
         _ => {
